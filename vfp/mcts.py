@@ -36,10 +36,20 @@ def child_finder(node, montecarlo):
     done = sketcher.sketch_done(p)
     done_functions = [u['name'] for u in done if u['type'] == 'function'] if done else []
     command = node.state.command
+
+
+    print(f"\n=== Node Expansion ===")
+    print(f"Command: {command}")
+    print(f"Program length: {len(p)}")
+    print(f"Next TODO: {todo}")
+    print(f"Done functions: {done_functions}")
+
     if command is None:
         if todo is None:
+            print("No TODO left, storing solution")
             montecarlo.solution = p
             return
+        print("Creating child node for 'next'")
         child = Node(State(p, "next"))
         node.add_child(child)
         child.update_win_value(1)
@@ -49,11 +59,13 @@ def child_finder(node, montecarlo):
             node.add_child(child)
             child.update_policy_value(0.3)
     elif command == 'next':
+        print(f"Dispatching implementer for TODO: {todo}")
         xp = driver.dispatch_implementer(p, todo, done)
         if xp is None:
             print("Didn't solve todo")
             node.update_win_value(-1)
         else:
+            print("TODO implemented, adding child node")
             add_standard_node(node, xp)
     elif command == 'edit':
         n = len(done_functions)
@@ -64,10 +76,13 @@ def child_finder(node, montecarlo):
                 edit_function = done_functions[-1] # arbitrary
         else:
             edit_function = done_functions[0]
+        print(f"Editing function: {edit_function}")
+
         xp = driver.llm_edit_function(p, todo, done, edit_function)
         if xp is None:
             print("Didn't solve edit")
         else:
+            print("Edit successful, adding child node")
             add_standard_node(node, xp)
 
 def main(spec, expansion_count = 20):

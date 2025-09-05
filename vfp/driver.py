@@ -42,7 +42,14 @@ def spec_maker(idea: str) -> str:
         return None
     return p
 
+#dispatch_implementer is called by the MCTS logic (from child_finder) 
+# whenever the tree decides it wants to “work on” a todo item in the program.
 def dispatch_implementer(p: str, todo, done) -> str:
+    # Print the current TODO and its type
+    print("=== LLM Implementer Called ===")
+    print("TODO:", todo)
+    print("Type:", todo.get('type'))
+
     if todo['type'] == 'function':
         return llm_implementer(p, todo)
     elif todo['type'] == 'lemma':
@@ -66,16 +73,220 @@ def lemma_implementer(p: str, todo, done) -> str:
         return llm_implementer(p, todo, done=done, hint="We found the following counterexamples to the lemma:\n" + cs_str+ "\nConsider editing the code instead of continuing to prove an impossible lemma.", edit_hint="A previous attempt had the following counterexamples for a desired property -- consider these carefully:\n" + cs_str)
     return llm_implementer(p, todo, done=done, hint="This induction sketch did NOT work on its own, but could be a good starting point if you vary/augment it:\n" + x)
 
+
+
+
+def llm_implementer(
+    p: str,
+    todo,
+    prev: str = None,
+    hint: str = None,
+    done: list[object] = None,
+    edit_hint: str = None
+) -> str:
+    """
+    Generates or edits a function or lemma in Dafny using LLM with explicit framing.
+
+    The prompt structure:
+    1. Framing instructions: only Dafny code, wrap in // BEGIN DAFNY ... // END DAFNY
+    2. Current program
+    3. Hints (from induction sketches, counterexamples, or previous hints)
+    4. Previous attempts and their errors
+    5. Optional edit instructions for reimplementing prior functions
+    """
+
+    # 1. General framing
+    framing = (
+        "You are an expert Dafny programmer.\n"
+        "Your goal is to implement code in the given Dafny program.\n"
+        "Focus only on the item named '{name}'.\n"
+        "Only output valid Dafny code between the markers exactly as shown:\n"
+        "// BEGIN DAFNY\n"
+        "<your code here>\n"
+        "// END DAFNY\n"
+        "Do not add any explanation or commentary outside the markers.\n\n"
+    )
+
+    # 2. Function- or lemma-specific framing
+    function_framing = (
+        "Task: Implement the body of a Dafny function that is specified but not yet implemented.\n"
+        "Function to implement: {name}\n\n"
+        "Requirements:\n"
+        "- Only output the body of the function (no outer braces).\n"
+        "- Begin with the line `// BEGIN DAFNY` and end with the line `// END DAFNY`.\n"
+        "- Do not include explanations or comments outside these markers.\n\n"
+        "Reference: Dafny syntax reminders\n"
+        "- Pattern matching:\n"
+        "    match e\n"
+        "    case Case1(arg1, arg2) => result1\n"
+        "    case Case2(arg1) => result2\n"
+        "    case _ => result3\n\n"
+        "- Use braces for multi-statement results (e.g., with variable assignments).\n"
+        "- Nested matches must be wrapped in parentheses:\n"
+        "    match e1\n"
+        "    case Case1(e2, _) =>\n"
+        "        (match e2\n"
+        "         case Case2(c2) => result2)\n"
+        "    case _ => result3\n\n"
+        "- Variable assignment:\n"
+        "    var x := e;\n"
+        "  (Semicolons are only needed for assignments.)\n"
+    )
+
+    lemma_framing = (
+        "Task: Implement the body of a Dafny lemma that is specified but not yet proven.\n"
+        "Lemma to implement: {name}\n\n"
+        "Requirements:\n"
+        "- Only output the body of the lemma (no outer braces).\n"
+        "- Begin with the line `// BEGIN DAFNY` and end with the line `// END DAFNY`.\n"
+        "- Do not include explanations or comments outside these markers.\n"
+    )
+
+    # Fill in program and name
+    ttype = todo.get('type', 'item')
+    tname = todo.get('name', '<unknown>')
+
+    if ttype == 'function':
+        specific_framing = function_framing.format(program=p, name=tname)
+    else:
+        specific_framing = lemma_framing.format(program=p, name=tname)
+
+    # 3. Build the structured prompt
+    prompt_parts = []
+    prompt_parts.append(framing.format(name=tname))
+    prompt_parts.append(specific_framing)
+    prompt_parts.append(f"### Task:\nImplement or fix the {ttype} '{tname}'.\n\n")
+
+    # 4. Hints
+    if hint:
+        prompt_parts.append("### Hints:\n")
+        prompt_parts.append(hint + "\n\n")
+
+    # 5. Previous attempts/errors
+    if prev:
+        prompt_parts.append("### Previous attempts and errors:\n")
+        prompt_parts.append(prev + "\n\n")
+
+    # 6. Optional edit instructions
+    done_functions = [u['name'] for u in done if u.get('type') == 'function'] if done else []
+    if done_functions:
+        prompt_parts.append(
+            "### Optional edits:\n"
+            f"If you think it's impossible to implement {tname} without re-implementing one of the previous functions, "
+            "you can write in one line:\n"
+            "// EDIT <function name>\n"
+            "where <function name> is one of the following: "
+            + ", ".join(done_functions) + "\n\n"
+        )
+
+    prompt = "".join(prompt_parts)
+
+    # Debug
+    print("=== PROMPT SENT TO LLM ===")
+    print(prompt)
+
+    # Call LLM
+    r = generate(prompt)
+    print("=== LLM RESPONSE ===")
+    print(r)
+
+    # Handle EDIT
+    edit_function = extract_edit_function(r, done_functions)
+    if edit_function:
+        return llm_edit_function(p, todo, done, edit_function, hint=edit_hint)
+
+    # Extract Dafny code
+    x = extract_dafny_program(r)
+    if x is not None:
+        x = extract_dafny_body(x, todo)
+    if x is None:
+        print("Missing Dafny program")
+        return None
+
+    # Insert back
+    xp = insert_program_todo(todo, p, x)
+    if xp is None:
+        print("Couldn't patch program")
+        return None
+
+    # Verify
+    e = sketcher.show_errors(xp)
+    if e is not None:
+        print("Errors in implementer:", e)
+        if prev is None:
+            return llm_implementer(p, todo, prev=e, hint=hint, done=done, edit_hint=edit_hint)
+        return None
+
+    return xp
+
+
+
+'''
+
 def llm_implementer(p: str, todo, prev: str = None, hint: str = None, done: list[object] = None, edit_hint: str = None) -> str:
+    """
+    Generates or edits a function or lemma in Dafny using LLM with explicit framing.
+
+    The prompt structure:
+    1. Framing instructions: only Dafny code, wrap in // BEGIN DAFNY ... // END DAFNY
+    2. Current program
+    3. Hints (from induction sketches, counterexamples, or previous hints)
+    4. Previous attempts and their errors
+    5. Optional edit instructions for reimplementing prior functions
+    """
+
+    # Basic framing: require only Dafny code between markers
+
+    #FIX
+    framing = (
+        "You are an expert Dafny programmer.\n"
+        You are an expert Dafny programmer. Your goal is to implement functions in the given Dafny program.
+        Focus only on the function named '{name}
+        "Only output valid Dafny code between the markers exactly as shown:\n"
+        "// BEGIN DAFNY\n"
+        "<your code here>\n"
+        "// END DAFNY\n"
+        "Do not add any explanation or commentary outside the markers.\n\n"
+    )
+
+    function_framing = "_____"
+
+    lemma_framing = "def prompt_lemma_implementer(program: str, name: str) -> str:
+    return f"You are implementing a lemma in a Dafny program that is specified but not fully implemented. The current program is\n{program}\n\nThe lemma to implement is {name}. Please just provide the body of the lemma (without the outer braces), starting with a line \"// BEGIN DAFNY\", ending with a line \"// END DAFNY\"."
+
+    prompt = framing + if todo['type'] == 'function' then function_framing  else lemma_framing
+
+    if hint is not None:
+        prompt += "\n" + hint
+
+    
+
+    # Current program context
+    prompt = framing
+    prompt += "### Current Dafny program:\n"
+    prompt += p + "\n\n"
+
+    # Task description (function or lemma)
+    ttype = todo.get('type', 'item')
+    tname = todo.get('name', '<unknown>')
+    prompt += f"### Task:\nImplement or fix the {ttype} '{tname}'. Provide only the body (no outer braces) if implementing a function/lemma body.\n\n"
+
+
+
     prompt = prompt_function_implementer(p, todo['name']) if todo['type'] == 'function' else prompt_lemma_implementer(p, todo['name'])
     if hint is not None:
         prompt += "\n" + hint
+
+    #to do add the preivous code
     if prev is not None:
         prompt += f"\nFYI only, a previous attempt on this {todo['type']} had the following errors:\n{prev}"
     done_functions = [u['name'] for u in done if u['type'] == 'function'] if done else []
+
     if done_functions:
         prompt += f"\nIf you think it's impossible to implement {todo['name']} without re-implementing one of the previous functions, you can write in one line\n// EDIT <function name>\n where <function name> is one of the following: " + ", ".join(done_functions) + f" to ask to re-implement the function instead of implementing {todo['name']}."
+    print(prompt)
     r = generate(prompt)
+
     print(r)
     edit_function = extract_edit_function(r, done_functions)
     if edit_function is not None:
@@ -97,6 +308,8 @@ def llm_implementer(p: str, todo, prev: str = None, hint: str = None, done: list
             return llm_implementer(p, todo, e)
         return None
     return xp
+'''
+    
 
 def llm_edit_function(p: str, todo, done, edit_function, hint: str = None) -> str:
     print('EDIT', edit_function)
